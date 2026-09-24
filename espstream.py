@@ -9,8 +9,11 @@ import numpy as np
 
 
 class MjpegStream:
+    MAX_BUFFER = 2 * 1024 * 1024  # 2 MB cap to prevent unbounded growth
+
     def __init__(self, url, connect_timeout=1.0, read_timeout=0.5):
         self.response = None
+        self._closed = False
         self.buffer = bytearray()
         try:
             request = urllib.request.Request(
@@ -28,7 +31,7 @@ class MjpegStream:
         return self.response is not None
 
     def read(self):
-        if self.response is None:
+        if self.response is None or self._closed:
             return False, None
 
         try:
@@ -61,11 +64,20 @@ class MjpegStream:
                     self.release()
                     return False, None
                 self.buffer.extend(chunk)
+                # Cap buffer to discard stale intermediate frames
+                while len(self.buffer) > self.MAX_BUFFER:
+                    # Find next frame boundary after current position
+                    marker = self.buffer.find(b"\xff\xd8", 1024)
+                    if marker > 0:
+                        del self.buffer[:marker]
+                    else:
+                        del self.buffer[:len(self.buffer) // 2]
         except (OSError, TimeoutError, urllib.error.URLError):
             self.release()
             return False, None
 
     def release(self):
+        self._closed = True
         if self.response is not None:
             self.response.close()
             self.response = None
@@ -81,6 +93,11 @@ class RobotCommandClient:
         self.last_command = None
         self.last_speed = None
 
+    @staticmethod
+    def format_payload(command, speed):
+        """Return one complete firmware command frame."""
+        return f"{command}, {int(speed)}\r\n".encode("utf-8")
+
     def send(self, command, speed=100, force=False):
         if command not in self.VALID_COMMANDS:
             raise ValueError(f"Unsupported robot command: {command}")
@@ -89,7 +106,7 @@ class RobotCommandClient:
         if not force and command == self.last_command and speed == self.last_speed:
             return True, "duplicate suppressed"
 
-        payload = f"{command}, {speed}\r\n".encode("utf-8")
+        payload = self.format_payload(command, speed)
         try:
             with socket.create_connection(
                     (self.host, self.port), timeout=self.timeout) as sock:
