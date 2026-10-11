@@ -1,26 +1,30 @@
 # How It Works
 
-This project is a simple embedded computer-vision control loop. The architecture splits cleanly into three parts:
+This project is a simple embedded computer-vision control loop with two
+runtime components:
 
 1. the ESP32 robot firmware
-2. the Python vision and control app
-3. the YOLO-based face tracking logic
+2. the self-contained Python vision and control app in `esp_app.py`
 
 ## 1. Robot firmware
 
-The firmware in `espcam.cpp` does three main jobs:
+The firmware in `espcam.cpp`:
 
 - initializes the camera
-- starts a Wi‑Fi access point
-- exposes a live MJPEG stream and a TCP command listener
+- starts a Wi-Fi access point
+- serves a live MJPEG stream
+- listens for TCP movement commands
+- drives the TB6612FNG motor controller
 
 ### Camera stream
 
-The camera captures frames and stores the latest JPEG in memory. An HTTP server exposes the stream at `/stream` using multipart MJPEG output. The Python app reads this stream with `MjpegStream` in `espstream.py`.
+The camera captures frames and stores the latest JPEG in memory. An HTTP
+server exposes the stream at `/stream` using multipart MJPEG output. The
+Python app reads this stream with the `MjpegStream` class in `esp_app.py`.
 
 ### Motor control
 
-The firmware also manages the motor driver. It accepts commands such as:
+The firmware accepts commands such as:
 
 ```text
 w, 180
@@ -30,110 +34,141 @@ d, 220
 p, 0
 ```
 
-The commands are mapped to `TB6612FNG` pins and drive the left and right motors with PWM. The code uses a straightforward tank-drive model instead of a full robotics framework.
+The commands map to forward, backward, left, right, and stop behavior. The
+second value is a PWM/speed value from `0` to `255`.
 
-### Wi‑Fi access point
+### Wi-Fi access point
 
-The board runs in AP mode, so a laptop just connects to the robot directly. That keeps the project simple and avoids needing a router or external network.
+The board runs in access-point mode, so the computer connects directly to the
+robot without a separate router.
 
-## 2. Stream transport layer
+## 2. Desktop transport layer
 
-The Python file `espstream.py` contains two classes:
+The transport section of `esp_app.py` contains:
 
-- `MjpegStream` — opens the stream and extracts JPEG frames from the multipart data
-- `RobotCommandClient` — sends simple commands to the robot over TCP
+- `MjpegStream` — opens the stream and extracts JPEG frames
+- `RobotCommandClient` — sends movement commands over TCP
 
-This layer is intentionally small and low-level. It handles network I/O and leaves the higher-level logic to the GUI and detection stack.
+`MjpegStream` keeps a bounded byte buffer and discards stale intermediate
+frames so the worker processes recent video instead of building latency.
+`RobotCommandClient` sends CRLF-terminated commands and suppresses duplicate
+movement commands. Stop commands can be forced through immediately.
 
-## 3. Vision and tracking logic
+## 3. Vision and recognition
 
-`espyolo.py` is the core of the robot behavior.
+The vision section of `esp_app.py` loads a supported YOLO face model and
+returns bounded face boxes with confidence values.
 
-### Model loading
+### Embeddings
 
-The script loads a YOLO face model from the local `yolo/` directory or a download URL. Supported models include:
+The app tries to use InsightFace/ArcFace embeddings for appearance matching.
+If InsightFace is unavailable, it uses a deterministic image-statistics
+embedding fallback. The fallback keeps target tracking functional but is less
+reliable for recognizing a person across different views.
 
-- `yolo26n-face.pt`
-- `yolov8n-face.pt`
-- `yolov10n-face.pt`
+### Target selection and memory
 
-### Detection
+When the user clicks a face, the app creates a session target profile
+containing:
 
-Each video frame is passed through the YOLO model. The detector returns bounding boxes for faces with their confidence scores.
-
-### Target selection
-
-The user clicks a face in the live app. The app stores that face as the selected target and records a profile that includes:
-
-- relative size within the frame
+- relative width and height
 - aspect ratio
-- HSV color histogram of the face crop
+- normalized center position
+- an appearance embedding
 
-This profile becomes the “memory” used for reacquiring the face if it temporarily goes out of frame or is partially occluded.
+The target is persisted as `memory/target.json`. Named familiar-face
+memories use additional JSON files. Each memory can retain a small ensemble of
+embeddings and is updated incrementally after confirmed matches.
 
-### Decision making
+### Reacquisition order
 
-Once a selected face is known, the code compares the target center to the frame center. The resulting decision can be:
+For each frame, the worker attempts to keep the target in this order:
 
-- `LEFT` or `RIGHT` — rotate to center the face horizontally
-- `CLOSE` or `FAR` — move forward or backward to adjust distance
-- `GOOD` — keep the robot stopped
-- `NO TARGET` — no valid tracked face
+1. bounding-box overlap with the previous target
+2. distance from the previous target position
+3. learned session profile similarity
+4. matching against stored familiar-face memories
 
-This decision is translated into a command like `a`, `d`, `w`, `s`, or `p` and the speed is adjusted based on how far the target is offset from center.
+The target is retained through short detection gaps. After the loss window is
+exceeded, the worker clears the active selection.
 
-## 4. Desktop control application
+## 4. Movement decisions
 
-`esp_app.py` is a Tkinter app that ties the stream, model, user interaction, and motor control together.
+The classifier compares the target with the frame center and face-size
+thresholds. It can produce:
+
+- `LEFT` or `RIGHT` — rotate to center the face
+- `CLOSE` or `FAR` — move backward or forward to adjust distance
+- `GOOD` — the target is aligned and at a suitable distance
+- `NO TARGET` — there is no active target
+
+The decision maps to `a`, `d`, `w`, `s`, or `p`. Turning speed increases with
+horizontal offset, while distance decisions use detected face size relative to
+the frame.
+
+## 5. Desktop application
+
+`esp_app.py` ties the stream, model, target state, recognition, and motor
+control together.
 
 ### UI flow
 
 The app displays:
 
-- main video canvas
-- a small preview of the target crop
-- status indicators for detection and connection
-- controls for model loading and confidence tuning
-- a log panel and decision state
+- the main video canvas
+- a crop preview of the tracked target
+- model, stream, and robot status
+- model loading and confidence controls
+- target memory similarity details
+- the current movement decision
 
-The user chooses a face by clicking on the frame. Then the worker thread continuously evaluates the current frame and updates the robot command.
+The app loads models and processes video outside the Tkinter event loop so the
+interface remains responsive.
 
 ### Worker thread
 
-The app uses a background thread to keep the UI responsive and avoid blocking the main event loop. That thread:
+The vision worker:
 
-- reads frames from the stream
-- runs the YOLO detector
-- tracks the selection
-- decides a motion command
-- sends it to the robot through `RobotCommandClient`
+1. connects to the MJPEG stream
+2. detects faces
+3. handles click-to-select requests
+4. reacquires and updates the target
+5. updates persistent face memory
+6. classifies movement
+7. sends the robot command
+8. publishes rendered frames and status events to the UI
 
-This design keeps the application responsive while still doing real-time image processing.
+The Tkinter thread polls an event queue and consumes only the latest rendered
+frame. Older rendered frames are dropped instead of queued, limiting display
+latency.
 
-## 5. Overall closed loop
-
-The end-to-end behavior is:
+## 6. Overall closed loop
 
 ```mermaid
 flowchart LR
-    A[Camera captures frame] --> B[ESP32 serves MJPEG stream]
-    B --> C[Desktop app reads frame]
+    A[ESP32 camera captures frame] --> B[ESP32 serves MJPEG]
+    B --> C[Python app reads latest frame]
     C --> D[YOLO detects faces]
-    D --> E[Selected face is tracked]
-    E --> F[Decision logic chooses motion]
-    F --> G[Robot command sent over TCP]
-    G --> H[Motor driver moves robot]
+    D --> E[Target is selected or reacquired]
+    E --> F[Movement decision]
+    F --> G[TCP command: w/s/a/d/p]
+    G --> H[TB6612FNG drives motors]
     H --> A
 ```
 
-This loop continuously reduces the difference between the face center and the image center, effectively making the robot “follow” the person.
+## 7. Persistence and shutdown
 
-## 6. Why it works well for a demo
+Face memories are stored as JSON in `memory/`. The files contain normalized
+embeddings, geometry statistics, confidence, and tracking counters. Existing
+memory files remain compatible with the consolidated app.
 
-This project is intentionally compact:
+When the worker stops, it releases the MJPEG stream and sends a stop command
+to the robot. The Stop button and `Esc` key also issue a direct stop request
+so they do not need to wait for a complete vision iteration.
 
-- the ESP32 handles networking and motor control
-- the PC handles heavier machine-vision work
-- the control logic is a simple closed-loop visual tracker
+## 8. Why it works well for a demo
 
-That makes it easy to understand, debug, and extend with additional behaviors.
+The ESP32 handles networking, camera capture, and motor control while the
+computer handles heavier machine-vision work. The single-file desktop app
+keeps the demo easy to run and makes the complete control loop easy to inspect
+and extend.

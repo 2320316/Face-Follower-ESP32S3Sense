@@ -1,12 +1,15 @@
 # Usage Guide
 
-This guide explains how to run the robot and use the face-following workflow in practice.
+This guide explains how to prepare, start, operate, and stop the
+face-following robot. The desktop implementation is self-contained in
+`esp_app.py`.
 
 ## 1. Power up the robot
 
-Power the ESP32 and motors with a stable supply. Make sure the TB6612FNG driver and motor wiring match the definitions in `espcam.cpp`.
+Power the ESP32 and motors with a stable supply. Make sure the TB6612FNG
+driver and motor wiring match the definitions in `espcam.cpp`.
 
-The firmware starts a Wi‑Fi access point and serves the camera stream at:
+The firmware starts a Wi-Fi access point and serves the camera stream at:
 
 ```text
 http://192.168.4.1/stream
@@ -18,9 +21,9 @@ The TCP command listener is also available at:
 192.168.4.1:8080
 ```
 
-## 2. Connect your Mac to the robot network
+## 2. Connect your computer to the robot network
 
-On the Mac, join the robot SSID created by the ESP32, typically:
+Join the Wi-Fi network created by the ESP32, typically:
 
 ```text
 XIAO-ESP32S3
@@ -34,105 +37,138 @@ const char *AP_PASS = "12345678";
 
 ## 3. Install Python dependencies
 
-From the repo root:
+From the repository root:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install opencv-python pillow ultralytics
+python -m pip install opencv-python pillow ultralytics
 ```
 
-If your system does not already have the model file, you can download it through the app or place one in the `yolo/` folder.
+For optional ArcFace-based familiar-face recognition, also install:
+
+```bash
+python -m pip install insightface onnxruntime
+```
+
+If InsightFace is not installed or cannot initialize, the app uses a
+lower-accuracy image-statistics embedding fallback.
+
+Supported model files are `yolo26n-face.pt`, `yolov8n-face.pt`, and
+`yolov10n-face.pt`. They can be placed in `yolo/` manually or downloaded from
+the app.
 
 ## 4. Start the desktop app
 
 ```bash
-python esp_app.py
+python3 esp_app.py
 ```
 
-On launch, the app:
+On launch, the app initializes the UI and starts loading the default YOLO
+model in the background. It does not connect to the robot until you press
+`Connect`.
 
-- initializes the UI
-- loads the default YOLO face model
-- connects to the camera stream
-- prepares the robot command client
+The model status must show `Ready` before the app can connect.
 
 ## 5. Select the target face
 
 When the live camera feed is visible:
 
-- click on the face you want the robot to follow
-- the app picks the face containing the click and stores a profile for it
-- the target profile is based on the selected face dimensions and color histogram
+1. Click on the detected face you want the robot to follow.
+2. The app chooses the largest detected face containing the click.
+3. A session profile is created from the face geometry and appearance
+   embedding.
+4. The selected face is persisted as `memory/target.json`.
 
-The robot begins making motion decisions after the target is selected.
+The robot begins making movement decisions after the target is selected.
 
 ## 6. Behavior while tracking
 
-The detection loop continuously does the following:
+The worker continuously:
 
 1. reads a new MJPEG frame from the ESP32
 2. runs YOLO face detection
-3. finds the selected face or a similar face nearby
-4. measures how far the face is from the center of the frame
-5. decides whether to move forward, backward, or turn
-6. sends the correct command to the robot
+3. finds the target by overlap or proximity
+4. falls back to the learned profile and stored-face matching when needed
+5. measures the target position and size
+6. decides whether to move forward, backward, turn, or stop
+7. sends the command to the robot
 
-This is all implemented in `espyolo.py` and the worker thread in `esp_app.py`.
+Short detection gaps retain the target profile for reacquisition. If the
+target is missing for too long, tracking is released.
 
 ## 7. Controls in the GUI
 
-The desktop app exposes a simple control interface:
+- **Model dropdown** — choose a supported YOLO face model
+- **Load / Unload** — load or release the selected model
+- **Confidence slider** — tune the detector threshold
+- **Target card** — show target memory status and similarity samples
+- **Connect / Disconnect** — start or stop the stream and tracking worker
+- **Stop robot** — immediately stop movement and clear the target
+- **Esc** — same as Stop robot
 
-- Model dropdown — choose a YOLO face model
-- Load / Unload — load or release the selected model
-- Confidence slider — tune how sensitive detection is
-- Open target view — show a closer crop of the tracked face
-- Stop robot — immediately issue a stop command
-- Esc key — same as stop
+Changing the model requires disconnecting, unloading/loading the desired model,
+and reconnecting.
 
-## 8. Typical operating flow
+## 8. Persistent face memory
 
-A normal tracking loop looks like this:
+Face memories are JSON files under `memory/`:
 
-- camera is streaming
-- a face is selected by click
-- the robot centers the face horizontally
-- if the face is too close or too far, the robot moves toward/away from it
-- if the target is lost briefly, it retains target memory and tries to reacquire it
-- if the target is missing for too long, tracking is released
+- `target.json` — the current selected target
+- other JSON files — named familiar faces when present
+
+Memories contain embeddings, geometry statistics, confidence, and tracking
+counters. The app updates confirmed familiar-face memories incrementally.
 
 ## 9. Troubleshooting
 
 ### App says stream unavailable
 
-- confirm the robot is on Wi‑Fi
-- check the board serial console for boot and camera status
-- make sure `http://192.168.4.1/stream` is reachable from the laptop
+- confirm the computer is connected to the ESP32 Wi-Fi network
+- check the board serial console for boot and camera errors
+- verify `http://192.168.4.1/stream` is reachable
 
 ### Model not found
 
-- put a supported file in `yolo/`
-- or use the built-in model picker to download a compatible file
+- place a supported model in `yolo/`
+- or use the model selector to download it
+- wait for the model status to show `Ready` before pressing `Connect`
+
+### No face detected
+
+- lower the confidence threshold
+- try another supported YOLO model
+- improve lighting and keep the face fully visible
+
+### Familiar-face recognition is unavailable
+
+- install `insightface` and `onnxruntime`
+- check that the InsightFace model can initialize on the host
+- target tracking still works with the built-in fallback embedding
 
 ### Robot does not respond
 
 - verify the command port is open on `192.168.4.1:8080`
-- check the motor driver, power supply, and pin assignments in the firmware
-- watch the serial output from the ESP32 for command logs
+- check the motor driver, power supply, and pin assignments
+- watch the ESP32 serial output for command logs
 
 ### Target drifts or loses lock
 
-- reduce the detection confidence if the model is overfitting to noise
+- reduce the confidence threshold if detections are unstable
 - improve lighting and keep the face in view
-- select a clear target in the center of the image first
+- select a clear target near the center of the image
 
-## 10. Extending the system
+## 10. Stop the app safely
 
-Good next improvements include:
+Press `Stop robot` or `Esc` before closing the window. Closing the app stops
+the worker, releases the camera stream, sends a stop command, and exits.
+
+## 11. Extending the system
+
+Possible future improvements include:
 
 - multiple-person tracking
 - obstacle avoidance
 - autonomous search when the face disappears
-- more stable PID-style motion control
-- a richer GUI for camera tuning and robot diagnostics
+- PID-style motion control
+- richer camera and robot diagnostics

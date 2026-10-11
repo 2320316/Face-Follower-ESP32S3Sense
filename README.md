@@ -1,20 +1,25 @@
 # Face-Follower-ESP32S3Sense
 
-A small face-following robot built around the XIAO ESP32S3 Sense camera module and a TB6612FNG motor driver. The ESP32 hosts its own Wi‑Fi access point, streams camera frames as MJPEG, and receives drive commands from a desktop Python app that runs YOLO-based face detection and tracking.
+A small face-following robot built around the XIAO ESP32S3 Sense camera module
+and a TB6612FNG motor driver. The ESP32 hosts its own Wi-Fi access point,
+streams camera frames as MJPEG, and receives drive commands from a desktop
+Python app that performs YOLO face detection and closed-loop tracking.
 
 ## What this repo contains
 
 - `espcam.cpp` — Arduino/ESP32 firmware for the robot
-- `espstream.py` — MJPEG stream client and TCP robot command client
-- `espyolo.py` — YOLO model loading, detection, target matching, and movement classification
-- `esp_app.py` — Tkinter desktop control app with live video, target selection, and controls
+- `esp_app.py` — self-contained Tkinter desktop app containing the MJPEG/TCP
+  transport, YOLO detection, target selection, recognition, and movement logic
 - `yolo/` — local YOLO face model files
+- `memory/` — persistent JSON face memories, including the active `target`
 
 ## Features
 
 - Live MJPEG camera stream from the ESP32
 - Click-to-select face tracking in a desktop app
-- YOLO face detection with target memory and profile matching
+- YOLO face detection with spatial, geometric, and embedding-based reacquisition
+- Optional ArcFace embeddings for stored face recognition
+- Persistent target and familiar-face memories under `memory/`
 - Closed-loop movement control for centering and following a face
 - Simple Wi‑Fi robot control over TCP: forward, backward, turn left, turn right, stop
 - Optional model downloads for supported YOLO face variants
@@ -52,7 +57,7 @@ Use this checklist before powering on the robot:
 
 ```mermaid
 flowchart LR
-    A[ESP32 camera captures frame] --> B[Wi‑Fi MJPEG stream at http://192.168.4.1/stream]
+    A[ESP32 camera captures frame] -->     B[Wi-Fi MJPEG stream at http://192.168.4.1/stream]
     B --> C[Python app reads stream]
     C --> D[YOLO face detection]
     D --> E[User selects target face]
@@ -93,26 +98,47 @@ From the repo root:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install opencv-python pillow ultralytics
+python -m pip install opencv-python pillow ultralytics
 ```
 
-If needed, install the exact model files under `yolo/` before running the app. You can also use the app’s model selection and download behavior.
+ArcFace support is optional. Install InsightFace and its runtime if you want
+embedding-based familiar-face recognition:
+
+```bash
+python -m pip install insightface onnxruntime
+```
+
+Without InsightFace, the app uses its built-in image-statistics embedding
+fallback. This is suitable for basic target tracking but is less reliable for
+recognizing people across different views.
+
+The repository includes supported model files under `yolo/`. The app can also
+download a missing supported model from the model selector.
 
 ### 4) Run the desktop app
 
 ```bash
-python esp_app.py
+python3 esp_app.py
 ```
 
-The GUI opens a control panel and live video window. It will try to load the configured model and then connect to the MJPEG stream.
+The GUI opens with the default model selected and begins loading it in the
+background. After the model status shows `Ready`, press `Connect` to open the
+MJPEG stream and robot command connection.
 
 ### 5) Use the app
 
-- Click a face in the live image to make it the tracked target.
-- The app keeps a profile of the selected face and tries to reacquire it if it briefly disappears.
-- The robot adjusts steering and forward/backward movement until the target stays centered.
-- Use the model picker and confidence slider to tune detection behavior.
-- Press `Esc` to stop the robot immediately.
+1. Connect the computer to the ESP32 access point.
+2. Load the selected YOLO model, downloading it if necessary.
+3. Press `Connect` and wait for the live stream.
+4. Click a detected face to select it as the target.
+5. Adjust the confidence threshold if detection is too sensitive or misses
+   faces.
+6. Press `Stop robot` or `Esc` to stop movement and clear the target.
+
+The app first tries to reacquire the target by overlap and proximity, then by
+the learned face profile. If no target is found for a prolonged period,
+tracking is released. Selecting a face creates or refreshes the persistent
+`target` memory.
 
 ## Command format
 
@@ -138,10 +164,13 @@ The second value is the PWM/speed command in the range `0..255`.
 
 ## File map
 
-- `esp_app.py` — desktop UI and control loop
-- `espstream.py` — Open MJPEG stream and socket command transport
-- `espyolo.py` — face detection, classification, and tracking logic
+- `esp_app.py` — desktop UI, transport, face detection, classification, and
+  tracking logic
 - `espcam.cpp` — XIAO ESP32S3 firmware
+- `tests/test_core.py` — unit tests for memory serialization, geometry, and
+  command framing
+- `docs/USAGE.md` — operating instructions and troubleshooting
+- `docs/HOW-IT-WORKS.md` — architecture and control-loop details
 
 ## Common troubleshooting
 
@@ -156,6 +185,7 @@ The second value is the PWM/speed command in the range `0..255`.
 - Lower the confidence threshold in the GUI.
 - Try a different YOLO model from the model dropdown.
 - Make sure the face is well-lit and fully visible.
+- Confirm the selected model status says `Ready` before connecting.
 
 ### Robot does not move
 
@@ -166,6 +196,9 @@ The second value is the PWM/speed command in the range `0..255`.
 ## Notes
 
 This project is intended as a compact embedded vision robot demo rather than a production-ready autonomous robot stack. The logic is intentionally simple and uses direct camera feedback from a single face target.
+
+The desktop app owns the computationally expensive work. The ESP32 only
+captures/streams frames and applies the movement commands it receives.
 
 If you want to extend it, the most natural next steps are:
 
